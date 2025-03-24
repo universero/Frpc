@@ -3,6 +3,7 @@ package frpc
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"github.com/univero/frpc/codec"
 	"io"
 	"log"
@@ -10,6 +11,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"time"
 )
 
 // MagicNumber 是标识协议的"魔法数字", 这里选用的是FRPC的ASCII码表示
@@ -21,12 +23,17 @@ type Option struct {
 	MagicNumber int
 	// 使用的编解码类型
 	CodecType codec.Type
+	// 连接超时
+	ConnectTimeout time.Duration
+	// 处理超时, 默认0表示不设限
+	HandleTimeout time.Duration
 }
 
 // DefaultOption 默认配置项
 var DefaultOption = &Option{
-	MagicNumber: MagicNumber,
-	CodecType:   codec.GobType,
+	MagicNumber:    MagicNumber,
+	CodecType:      codec.GobType,
+	ConnectTimeout: 10 * time.Second,
 }
 
 // Server 是一个FRPC服务端
@@ -83,16 +90,15 @@ func (s *Server) ServerConn(conn net.Conn) {
 		return
 	}
 	// 处理编解码器
-	s.serverCodec(f(conn))
+	s.serverCodec(f(conn), &opt)
 }
 
 var invalidRequest = struct{}{}
 
 // serverCodec 处理一个编解码器
-func (s *Server) serverCodec(cc codec.Codec) {
-	sending := new(sync.Mutex)
-	defer sending.Unlock()
-	wg := new(sync.WaitGroup) // wait until all request are handled
+func (s *Server) serverCodec(cc codec.Codec, opt *Option) {
+	sending := new(sync.Mutex) // make sure to send a complete response
+	wg := new(sync.WaitGroup)  // wait until all request are handled
 
 	for {
 		// 从连接中读取请求
@@ -106,7 +112,7 @@ func (s *Server) serverCodec(cc codec.Codec) {
 			continue
 		}
 		wg.Add(1)
-		go s.handleRequest(cc, req, sending, wg)
+		go s.handleRequest(cc, req, sending, wg, opt.ConnectTimeout)
 	}
 
 	// 等待所有请求完成，关闭连接
@@ -173,14 +179,35 @@ func (s *Server) sendResponse(cc codec.Codec, h *codec.Header, body interface{},
 }
 
 // handleRequest 处理一个请求
-func (s *Server) handleRequest(cc codec.Codec, req *request, sending *sync.Mutex, wg *sync.WaitGroup) {
+// TODO: 检查协程泄露问题s
+func (s *Server) handleRequest(cc codec.Codec, req *request, sending *sync.Mutex, wg *sync.WaitGroup, timeout time.Duration) {
 	defer wg.Done()
-	err := req.serv.call(req.mType, req.argv, req.replyv)
-	if err != nil {
-		req.h.Error = err
-		s.sendResponse(cc, req.h, invalidRequest, sending)
+	called := make(chan struct{})
+	sent := make(chan struct{})
+	go func() {
+		err := req.serv.call(req.mType, req.argv, req.replyv)
+		called <- struct{}{}
+		if err != nil {
+			req.h.Error = err
+			s.sendResponse(cc, req.h, invalidRequest, sending)
+			sent <- struct{}{}
+			return
+		}
+	}()
+
+	// 不限制超时
+	if timeout == 0 {
+		<-called
+		<-sent
+		return
 	}
-	s.sendResponse(cc, req.h, req.replyv.Interface(), sending)
+	select {
+	case <-time.After(timeout):
+		req.h.Error = errors.New(fmt.Sprintf("rpc server: request handle timeout: expect within %s", timeout))
+		s.sendResponse(cc, req.h, invalidRequest, sending)
+	case <-called:
+		<-sent
+	}
 }
 
 // Register 将一个类型注册到rpc服务中

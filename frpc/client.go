@@ -1,6 +1,7 @@
 package frpc
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"log"
 	"net"
 	"sync"
+	"time"
 )
 
 // Call 是一个RPC调用
@@ -130,7 +132,7 @@ func (c *Client) terminateCall(err error) {
 }
 
 // NewClient 创建客户端
-func NewClient(conn io.ReadWriteCloser, opt *Option) (*Client, error) {
+func NewClient(conn net.Conn, opt *Option) (*Client, error) {
 	f := codec.NewCodecFuncMap[opt.CodecType]
 	if f == nil {
 		err := fmt.Errorf("codec %s not supported", opt.CodecType)
@@ -207,26 +209,50 @@ func parseOptions(opts ...*Option) (*Option, error) {
 	return opt, nil
 }
 
-// Dial 在指定network上建立连接
-func Dial(network, addr string, opts ...*Option) (c *Client, err error) {
-	// 解析配置项
+type clientResult struct {
+	client *Client
+	err    error
+}
+
+type newClientFunc func(conn net.Conn, opt *Option) (client *Client, err error)
+
+// dialTimeout 处理连接超时
+// TODO: 检查协程泄露问题
+func dialTimeout(f newClientFunc, network, addr string, opts ...*Option) (c *Client, err error) {
 	opt, err := parseOptions(opts...)
 	if err != nil {
 		return nil, err
 	}
-	// 建立连接
-	conn, err := net.Dial(network, addr)
+	conn, err := net.DialTimeout(network, addr, opt.ConnectTimeout)
 	if err != nil {
 		return nil, err
 	}
-
-	// 创建失败则关闭连接
 	defer func() {
-		if c == nil {
+		if err != nil {
 			_ = conn.Close()
 		}
 	}()
-	return NewClient(conn, opt)
+
+	ch := make(chan clientResult)
+	go func() {
+		client, err := f(conn, opt)
+		ch <- clientResult{client, err}
+	}()
+	if opt.ConnectTimeout == 0 {
+		result := <-ch
+		return result.client, result.err
+	}
+	select {
+	case <-time.After(opt.ConnectTimeout):
+		return nil, errors.New(fmt.Sprintf("rpc client: connect timeout: expect whinin %s", opt.ConnectTimeout))
+	case result := <-ch:
+		return result.client, result.err
+	}
+}
+
+// Dial 在指定network上建立连接
+func Dial(network, addr string, opts ...*Option) (c *Client, err error) {
+	return dialTimeout(NewClient, network, addr, opts...)
 }
 
 // send 发送请求
@@ -279,7 +305,14 @@ func (c *Client) Go(serviceMethod string, args interface{}, reply interface{}, d
 }
 
 // Call 同步的执行RPC调用, 并返回错误响应
-func (c *Client) Call(serviceMethod string, args interface{}, reply interface{}) error {
+// 用户通过ctx管理超时机制
+func (c *Client) Call(ctx context.Context, serviceMethod string, args interface{}, reply interface{}) error {
 	call := <-c.Go(serviceMethod, args, reply, make(chan *Call, 1)).Done
-	return call.Error
+	select {
+	case <-ctx.Done():
+		c.removeCall(call.Seq)
+		return errors.New("rpc client: call failed: " + ctx.Err().Error())
+	case call := <-call.Done:
+		return call.Error
+	}
 }
