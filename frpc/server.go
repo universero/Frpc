@@ -3,12 +3,12 @@ package frpc
 import (
 	"encoding/json"
 	"errors"
-	"fmt"
 	"github.com/univero/frpc/codec"
 	"io"
 	"log"
 	"net"
 	"reflect"
+	"strings"
 	"sync"
 )
 
@@ -30,7 +30,9 @@ var DefaultOption = &Option{
 }
 
 // Server 是一个FRPC服务端
-type Server struct{}
+type Server struct {
+	serviceMap sync.Map
+}
 
 // NewServer 构造一个新的服务端
 func NewServer() *Server {
@@ -117,6 +119,8 @@ type request struct {
 	h      *codec.Header
 	argv   reflect.Value
 	replyv reflect.Value
+	mType  *methodType
+	serv   *service
 }
 
 // readRequestHeader 读取请求头
@@ -139,17 +143,27 @@ func (s *Server) readRequest(cc codec.Codec) (*request, error) {
 	}
 
 	req := &request{h: h}
-	// TODO: 目前argv的类型未知，先假设为string
 	// 读取body
-	req.argv = reflect.New(reflect.TypeOf(""))
-	if err := cc.ReadBody(req.argv.Interface()); err != nil {
-		log.Println("rpc server: read request body error", err)
+	req.serv, req.mType, err = s.findService(h.ServiceMethod)
+	if err != nil {
+		return req, err
 	}
+	req.argv = req.mType.newArgv()
+	req.replyv = req.mType.newReplyv()
 
+	// argvi 需要是一个指针
+	argvi := req.argv.Interface()
+	if req.argv.Type().Kind() != reflect.Ptr {
+		argvi = req.argv.Addr().Interface()
+	}
+	// 将请求报文反序列化为一个入参
+	if err := cc.ReadBody(argvi); err != nil {
+		log.Println("rpc server: read argv error", err)
+		return req, err
+	}
 	return req, nil
 }
 
-// sendResponse 向调用方写入响应
 func (s *Server) sendResponse(cc codec.Codec, h *codec.Header, body interface{}, sending *sync.Mutex) {
 	sending.Lock()
 	defer sending.Unlock()
@@ -160,9 +174,45 @@ func (s *Server) sendResponse(cc codec.Codec, h *codec.Header, body interface{},
 
 // handleRequest 处理一个请求
 func (s *Server) handleRequest(cc codec.Codec, req *request, sending *sync.Mutex, wg *sync.WaitGroup) {
-	// TODO, should call registered rpc methods to get the right replyv
-	// day 1, just print argv and send a hello message
-	log.Println(req.h, req.argv.Elem())
-	req.replyv = reflect.ValueOf(fmt.Sprintf("frpc resp %d", req.h.Seq))
+	defer wg.Done()
+	err := req.serv.call(req.mType, req.argv, req.replyv)
+	if err != nil {
+		req.h.Error = err
+		s.sendResponse(cc, req.h, invalidRequest, sending)
+	}
 	s.sendResponse(cc, req.h, req.replyv.Interface(), sending)
+}
+
+// Register 将一个类型注册到rpc服务中
+func (s *Server) Register(rcvr interface{}) error {
+	serv := newService(rcvr)
+	if _, dip := s.serviceMap.LoadOrStore(serv.name, serv); dip {
+		return errors.New("rpc server: service already defined, " + serv.name)
+	}
+	return nil
+}
+
+// Register 使用默认server注册
+func Register(rcvr interface{}) error {
+	return DefaultServer.Register(rcvr)
+}
+
+// 根据<service>.<method>找到service中对应的method
+func (s *Server) findService(serviceMethod string) (serv *service, mType *methodType, err error) {
+	dot := strings.LastIndex(serviceMethod, ".")
+	if dot < 0 {
+		err = errors.New("rpc server: service/method request ill-formed: " + serviceMethod)
+		return
+	}
+	servName, methodName := serviceMethod[:dot], serviceMethod[dot+1:]
+	servi, ok := s.serviceMap.Load(servName)
+	if !ok {
+		err = errors.New("rpc server: can't find service: " + serviceMethod)
+	}
+	serv = servi.(*service)
+	mType = serv.method[methodName]
+	if mType == nil {
+		err = errors.New("rpc server: can't find method: " + serviceMethod)
+	}
+	return
 }
